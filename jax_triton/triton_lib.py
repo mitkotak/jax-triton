@@ -51,6 +51,7 @@ try:
   import triton.language as tl
   from triton.runtime import autotuner
   import triton._C.libtriton as _triton
+  from triton._C.libtriton import ir as tl_ir
   import triton.backends.nvidia.compiler as cb
 
   CAN_USE_TRITON = True
@@ -370,12 +371,11 @@ def get_or_create_triton_kernel(
   # `JITFunction._get_config` to get the specialization_attr.
   mock_torch_tensor = types.SimpleNamespace(data_ptr=lambda: 16)
   args_for_specialization_attr = [mock_torch_tensor] * len(arg_dtypes)
-  backend = backend_init_func(device, compute_capability)
   for i, _, v in scalar_args:
     args_for_specialization_attr[i] = v
+  specialization_attr = fn._get_config(*args_for_specialization_attr)  # pylint: disable=protected-access
 
-  specialization_attr = backend.get_attrs_descriptor(fn.params[:len(args_for_specialization_attr)], args_for_specialization_attr)  # pylint: disable=protected-access
-  constants = dict(metaparams)
+  constants = {k: v for k, v in metaparams.items()}
   constants.update({k: None for _, k, v in scalar_args if v is None})
   constants.update({fn.arg_names[i]: 1 for i in specialization_attr.equal_to_1})
 
@@ -383,7 +383,7 @@ def get_or_create_triton_kernel(
   cache_key = (
       fn,
       tuple(signature.items()),
-      tuple(specialization_attr.get_fn_attrs()),
+      tuple(vars(specialization_attr).values()),
       tuple(constants.items()),
       num_warps,
       num_stages,
@@ -403,6 +403,7 @@ def get_or_create_triton_kernel(
         "enable_fp_fusion": enable_fp_fusion,
     }
 
+    backend = backend_init_func(device, compute_capability)
     options = backend.parse_options(opts)
 
     kernel_hash = abs(hash(cache_key))
@@ -537,10 +538,7 @@ def triton_kernel_call_lowering(
   named_args = dict(unsafe_zip(fn.arg_names, args))
 
   if isinstance(fn, autotuner.Autotuner):
-    if hasattr(fn, "key_idx"):
-      key_idxs = fn.key_idx  # Triton <=3.2
-    else:
-      key_idxs = [fn.arg_names.index(k) for k in fn.keys]
+    key_idxs = [fn.arg_names[k] for k in fn.key_idx]
     if any(idx not in key_idxs for idx, _, _ in scalar_args):
       logging.warning(
           "Auto-tuning key does not include all scalar arguments. "
@@ -645,7 +643,7 @@ def triton_kernel_call_lowering(
         kernel_params.append(
             triton_kernel_call_lib.create_array_parameter(
                 zeroed_params_with_sizes.get(i, 0),
-                16 if (i in specialization_attr.divisibility_16) else 0,
+                16 if (i in specialization_attr.divisible_by_16) else 0,
             )
         )
       elif i not in specialization_attr.equal_to_1:
